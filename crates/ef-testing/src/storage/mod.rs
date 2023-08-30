@@ -28,6 +28,7 @@ use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::utils::starknet::get_starknet_storage_key;
 
+use self::eoa::get_nonce;
 use self::{contract::initialize_contract_account, eoa::initialize_eoa};
 
 pub struct ClassHashes {
@@ -60,7 +61,7 @@ pub fn write_test_state(
     // iterate through pre-state addresses
     for (address, account_info) in state.iter() {
         let mut storage = HashMap::new();
-        let address = Felt252Wrapper::from(address.to_owned()).into();
+        let address: FieldElement = Felt252Wrapper::from(address.to_owned()).into();
         let starknet_address =
             compute_starknet_address(kakarot_address, class_hashes.proxy_class_hash, address);
 
@@ -102,6 +103,10 @@ pub fn write_test_state(
         );
 
         write_madara_to_katana_storage(vec![proxy_implementation_storage_tuples], &mut storage);
+
+        // print nonce
+        let nonce = get_nonce(kakarot_address, &class_hashes, starknet, address).unwrap();
+        println!("nonce ca pre: {}", nonce);
 
         // now, finally, we update the sequencer state with the eth->starknet address
         let address = StarknetContractAddress(

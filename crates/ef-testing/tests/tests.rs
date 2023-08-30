@@ -28,5 +28,6 @@ mod blockchain_tests {
             .expect("setting tracing default failed");
     }
 
-    blockchain_tests!(vm_tests, VMTests);
+    // blockchain_tests!(vm_tests, VMTests);
+    blockchain_tests!(sstore_tests, stSStoreTest);
 }

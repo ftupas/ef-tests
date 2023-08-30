@@ -3,7 +3,10 @@
 use super::{result::CaseResult, BlockchainTestTransaction};
 use crate::{
     get_signed_rlp_encoded_transaction,
-    storage::{eoa::get_eoa_class_hash, write_test_state, ClassHashes},
+    storage::{
+        eoa::{get_eoa_class_hash, get_nonce},
+        implementation_class_hash, write_test_state, ClassHashes,
+    },
     traits::Case,
     utils::{
         assert::assert_contract_post_state,
@@ -19,13 +22,21 @@ use kakarot_rpc_core::{
     models::felt::Felt252Wrapper,
     test_utils::deploy_helpers::{DeployedKakarot, KakarotTestEnvironmentContext},
 };
+use katana_core::backend::state::MemDb;
 use regex::Regex;
+use reth_primitives::{BlockId, BlockNumberOrTag, H160};
+use revm_primitives::U256;
 use starknet::{core::types::FieldElement, providers::Provider};
-use starknet_api::{core::ContractAddress as StarknetContractAddress, hash::StarkFelt};
+use starknet_api::{
+    core::{ContractAddress as StarknetContractAddress, Nonce},
+    hash::StarkFelt,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    str::FromStr,
 };
+use tokio::sync::RwLockWriteGuard;
 
 #[derive(Debug)]
 pub struct BlockchainTestCase {
@@ -33,6 +44,12 @@ pub struct BlockchainTestCase {
     pub tests: BTreeMap<String, BlockchainTest>,
     pub transaction: BlockchainTestTransaction,
     skip: bool,
+}
+
+#[derive(Debug)]
+pub enum AccountType {
+    EOA,
+    ContractAccount,
 }
 
 async fn handle_pre_state(
@@ -43,15 +60,22 @@ async fn handle_pre_state(
     let kakarot_address = kakarot.kakarot_address;
 
     let mut starknet = env.sequencer().sequencer.backend.state.write().await;
+    let class_hashes = class_hashes(env, &starknet);
+    write_test_state(pre_state, kakarot_address, class_hashes, &mut starknet)?;
+    Ok(())
+}
 
-    let eoa_class_hash = get_eoa_class_hash(env, &starknet).expect("failed to get eoa class hash");
-    let class_hashes = ClassHashes::new(
+fn class_hashes(
+    env: &KakarotTestEnvironmentContext,
+    starknet: &RwLockWriteGuard<'_, MemDb>,
+) -> ClassHashes {
+    let kakarot = env.kakarot();
+    let eoa_class_hash = get_eoa_class_hash(env, starknet).expect("failed to get eoa class hash");
+    ClassHashes::new(
         kakarot.proxy_class_hash,
         eoa_class_hash,
         kakarot.contract_account_class_hash,
-    );
-    write_test_state(pre_state, kakarot_address, class_hashes, &mut starknet)?;
-    Ok(())
+    )
 }
 
 // Division of logic:
@@ -108,6 +132,13 @@ impl BlockchainTestCase {
         )?;
 
         let client = env.client();
+        let nonce = client
+            .nonce(
+                H160::from_str("0x6295ee1b4f6dd65047762f924ecd367c17eabf8f").unwrap(),
+                BlockId::Number(BlockNumberOrTag::Latest),
+            )
+            .await;
+        println!("nonce before: {:?}", nonce);
         let hash = client
             .send_transaction(tx_encoded.to_vec().into())
             .await
@@ -121,6 +152,13 @@ impl BlockchainTestCase {
             .await
             .map_err(|err| ef_tests::Error::Assertion(err.to_string()))?;
 
+        let nonce = client
+            .nonce(
+                H160::from_str("0x6295ee1b4f6dd65047762f924ecd367c17eabf8f").unwrap(),
+                BlockId::Number(BlockNumberOrTag::Latest),
+            )
+            .await;
+        println!("nonce after: {:?}", nonce);
         Ok(())
     }
 
@@ -145,7 +183,8 @@ impl BlockchainTestCase {
         let kakarot_address = kakarot.kakarot_address;
 
         // Get lock on the Starknet sequencer
-        let starknet = env.sequencer().sequencer.backend.state.read().await;
+        let mut starknet = env.sequencer().sequencer.backend.state.write().await;
+        let class_hashes = class_hashes(env, &starknet);
 
         for (evm_address, expected_state) in post_state.iter() {
             let addr: FieldElement = Felt252Wrapper::from(*evm_address).into();
@@ -157,12 +196,34 @@ impl BlockchainTestCase {
                     .unwrap(),
             );
 
-            let actual_state = starknet.storage.get(&address).ok_or_else(|| {
+            // print nonce
+            let nonce = get_nonce(kakarot_address, &class_hashes, &starknet, addr).unwrap();
+            println!("nonce ca post: {}", nonce);
+
+            let actual_state = starknet.storage.get_mut(&address).ok_or_else(|| {
                 ef_tests::Error::Assertion(format!(
                     "failed test {}: missing evm address {:?} in post state storage",
                     test_case_name, evm_address
                 ))
             })?;
+
+            // If account is a contract account, use managed nonce instead of protocol-level nonce
+            if implementation_class_hash(expected_state, &class_hashes)
+                == class_hashes.contract_account_class_hash
+            {
+                println!("evm_address: {:?}", evm_address);
+                let nonce = env
+                    .client()
+                    .nonce(*evm_address, BlockId::Number(BlockNumberOrTag::Latest))
+                    .await
+                    .map_err(|err| {
+                        ef_tests::Error::Assertion(format!(
+                            "failed test:{}: failed to get nonce for address {:?} in post state storage: {}",
+                            test_case_name, evm_address, err
+                        ))
+                    })?;
+                actual_state.nonce = unsafe { std::mem::transmute::<U256, Nonce>(nonce) };
+            };
 
             assert_contract_post_state(test_case_name, expected_state, actual_state)?;
         }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use hive_utils::kakarot::compute_starknet_address;
 use kakarot_rpc_core::test_utils::deploy_helpers::KakarotTestEnvironmentContext;
 use katana_core::backend::state::MemDb;
 use starknet::core::types::FieldElement;
@@ -10,6 +11,8 @@ use starknet_api::{
 use tokio::sync::RwLockWriteGuard;
 
 use crate::utils::starknet::get_starknet_storage_key;
+
+use super::ClassHashes;
 
 /// Returns the class hash used for the EOA contract.
 pub fn get_eoa_class_hash(
@@ -37,6 +40,37 @@ pub fn get_eoa_class_hash(
     .into();
 
     Ok(eoa_class_hash)
+}
+
+/// Returns nonce
+pub fn get_nonce(
+    kakarot_address: FieldElement,
+    class_hashes: &ClassHashes,
+    starknet: &RwLockWriteGuard<'_, MemDb>,
+    evm_address: FieldElement,
+) -> Result<FieldElement, eyre::Error> {
+    let starknet_address =
+        compute_starknet_address(kakarot_address, class_hashes.proxy_class_hash, evm_address);
+
+    let starknet_address =
+        StarknetContractAddress(Into::<StarkFelt>::into(starknet_address).try_into()?);
+
+    // get the nonce
+    let nonce: FieldElement = (*starknet
+        .storage
+        .get(&starknet_address)
+        .ok_or_else(|| eyre::eyre!("Failed to get storage for eoa at {:?}", evm_address))?
+        .storage
+        .get(&get_starknet_storage_key("nonce", &[], 0))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "Failed to get value at key _implementation for eoa at {:?}",
+                evm_address
+            )
+        })?)
+    .into();
+
+    Ok(nonce)
 }
 
 /// Initializes the EOA contract.
